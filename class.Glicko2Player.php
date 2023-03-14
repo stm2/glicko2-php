@@ -5,6 +5,8 @@
  Corrected implementation of Glicko2
 
  License: LGPLv3
+ 
+ Further modified by stm <stm2@users.sf.net>
 
  Modified by Guangcong Luo on 2012 Sept 28
  <guangcongluo@gmail.com>
@@ -26,7 +28,7 @@
  Usage
  Glicko2Player([$rating = 1500 [, $rd = 350 [, $volatility = 0.06 [, $mu [, $phi [, $sigma [, $systemconstant = 0.75 ]]]]]]]
  For new players, use the default values for rating, rd, and volatility.
- The systemconstant should be between 0.3 and 1.2, depending on system itself (this is game dependent, and must be set
+ The system constant tau should be between 0.3 and 1.2, depending on system itself (this is game dependent, and must be set
  by estimation or experimentation)
 
  Updating a Glicko2Player
@@ -72,34 +74,46 @@ class Glicko2Player {
 
   public $tau;
 
-  private $pi2 = 9.8696044;
+  const PI2 = 9.8696044;
+
+  const DEFAULT_RATING = 1500;
+
+  const DEFAULT_RD = 350;
+
+  const MIN_RD = 20;
+
+  const DEFAULT_VOLATILITY = .06;
+
+  const DEFAULT_TAU = .075;
+
+  const DEFAULT_DEV = 173.7178;
 
   var $M = array();
 
-  function __construct($rating = 1500, $rd = 350, $volatility = 0.06, $mu = null, $phi = null, $sigma = null,
-    $systemconstant = 0.75) {
+  function __construct($rating = null, $rd = null, $volatility = null, $mu = null, $phi = null, $sigma = null,
+    $tau = null) {
     // Step 1
-    $this->rating = $rating;
-    $this->rd = $rd;
+    $this->rating = is_null($rating) ? self::DEFAULT_RATING : $rating;
+    $this->rd = is_null($rd) ? self::DEFAULT_RD : $rd;
     // volatility
     if (is_null($sigma)) {
-      $this->sigma = $volatility;
+      $this->sigma = is_null($volatility) ? self::DEFAULT_VOLATILITY : $volatility;
     } else {
       $this->sigma = $sigma;
     }
     // System Constant
-    $this->tau = $systemconstant;
+    $this->tau = is_null($tau) ? self::DEFAULT_TAU : $tau;
 
     // Step 2
     // Rating
     if (is_null($mu)) {
-      $this->mu = ($this->rating - 1500) / 173.7178;
+      $this->mu = ($this->rating - self::DEFAULT_RATING) / self::DEFAULT_DEV;
     } else {
       $this->mu = $mu;
     }
     // Rating Deviation
     if (is_null($phi)) {
-      $this->phi = $this->rd / 173.7178;
+      $this->phi = $this->rd / self::DEFAULT_DEV;
     } else {
       $this->phi = $phi;
     }
@@ -133,12 +147,13 @@ class Glicko2Player {
 
   function AddMatches($M) {
     // This is where the Glicko2 rating calculation actually happens
+    $eps = .0001;
 
     // Follow along the steps using: http://www.glicko.net/glicko/glicko2.pdf
     if (count($M) == 0) {
       $phi_p = sqrt(($this->phi * $this->phi) + ($this->sigma * $this->sigma));
-      return array('r' => $this->rating, 'RD' => 173.7178 * $phi_p, 'mu' => $this->mu, 'phi' => $phi_p,
-        'sigma' => $this->sigma);
+      $rd = max(self::MIN_RD, min(self::DEFAULT_RD, self::DEFAULT_DEV * $phi_p));
+      return array('r' => $this->rating, 'RD' => $rd, 'mu' => $this->mu, 'phi' => $phi_p, 'sigma' => $this->sigma);
     }
 
     // summation parts of Step 3 & 4 & 7
@@ -164,12 +179,86 @@ class Glicko2Player {
     $delta = $v * $delta_sum;
 
     // Step 5
+    // $sigma_p = $this->approxNR($delta, $v, $eps);
+    $sigma_p = $this->approxIllinois($delta, $v, $eps);
+
+    // Step 6
+    $phi_star = sqrt($this->phi * $this->phi + $sigma_p * $sigma_p);
+
+    // Step 7
+    $phi_p = 1.0 / sqrt(1.0 / ($phi_star * $phi_star) + 1.0 / $v);
+    // New mu
+    $mu_p = $this->mu + $phi_p * $phi_p * $mu_p_sum;
+
+    $rd = self::DEFAULT_DEV * $phi_p;
+    if ($rd > self::DEFAULT_RD) {
+      debug_to_apache("rd $rd");
+      $rd = self::DEFAULT_RD;
+    }
+    $rd = max(self::MIN_RD, $rd);
+
+    return array('r' => (self::DEFAULT_DEV * $mu_p) + self::DEFAULT_RATING, 'RD' => $rd, 'mu' => $mu_p, 'phi' => $phi_p,
+      'sigma' => $sigma_p);
+  }
+
+  function approxIllinois($delta, $v, $eps) {
+    // 1.
+    $a = log($this->sigma * $this->sigma);
+
+    // 2.
+    $A = $a;
+    $deltasq = $delta * $delta;
+    $phisq = $this->phi * $this->phi;
+    if ($deltasq > $phisq + $v) {
+      $B = log($deltasq - $phisq - $v);
+    } else {
+      $k = 1;
+      while ($this->f_illinois($a - $k * $this->tau, $a, $deltasq, $phisq, $v) < 0) {
+        ++$k;
+      }
+      $B = $a - $k * $this->tau;
+    }
+
+    // 3.
+    $fa = $this->f_illinois($A, $a, $deltasq, $phisq, $v);
+    $fb = $this->f_illinois($B, $a, $deltasq, $phisq, $v);
+
+    // 4.
+    while (abs($B - $A) > $eps) {
+      $C = $A + ($A - $B) * $fa / ($fb - $fa);
+      $fc = $this->f_illinois($C, $a, $deltasq, $phisq, $v);
+
+      if ($fc * $fb <= 0) {
+        $A = $B;
+        $fa = $fb;
+      } else {
+        $fa = $fa / 2;
+      }
+
+      $B = $C;
+      $fb = $fc;
+    }
+
+    return exp($A / 2);
+  }
+
+  function f_illinois($x, $a, $deltasq, $phisq, $v) {
+    $f = exp($x) * ($deltasq - $phisq - $v - exp($x));
+    $den = ($phisq + $v + exp($x));
+    $den *= $den;
+    $f /= 2 * $den;
+    $f -= ($x - $a) / $this->tau / $this->tau;
+    return $f;
+  }
+
+  function approxNR($delta, $v, $eps) {
     $a = log($this->sigma * $this->sigma);
     $x_prev = $a;
     $x = $x_prev;
     $tausq = $this->tau * $this->tau;
     $phisq = $this->phi * $this->phi;
     $deltasq = $delta * $delta;
+
     do {
       $exp_xp = exp($x_prev);
       $d = $this->phi * $this->phi + $v + $exp_xp;
@@ -180,24 +269,13 @@ class Glicko2Player {
       $tmp_x = $x;
       $x = $x_prev - ($h1 / $h2);
       $x_prev = $tmp_x;
-    } while (abs($x - $x_prev) > 0.1);
+    } while (abs($x - $x_prev) > $eps);
 
-    $sigma_p = exp($x / 2);
-
-    // Step 6
-    $phi_star = sqrt($phisq + ($sigma_p * $sigma_p));
-
-    // Step 7
-    $phi_p = 1.0 / (sqrt((1.0 / ($phi_star * $phi_star)) + (1.0 / $v)));
-    // New mu
-    $mu_p = $this->mu + $phi_p * $phi_p * $mu_p_sum;
-
-    return array('r' => (173.7178 * $mu_p) + 1500, 'RD' => 173.7178 * $phi_p, 'mu' => $mu_p, 'phi' => $phi_p,
-      'sigma' => $sigma_p);
+    return exp($x / 2);
   }
 
   function g($phi) {
-    return 1.0 / (sqrt(1.0 + (3.0 * $phi * $phi) / ($this->pi2)));
+    return 1.0 / (sqrt(1.0 + (3.0 * $phi * $phi) / self::PI2));
   }
 
   function E($mu, $mu_j, $phi_j) {
